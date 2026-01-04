@@ -26,22 +26,49 @@ TIPO_GASTO_OPTIONS = [
     "electronic",
     "libro",
     "otro",
-    "Google Suite",
-    "software",
-    "Google Ads",
-    "Facebook Ads",
-    "Shuttherstock",
-    "Canva",
     "Airbnb",
     "Uber",
+    "Google Suite",
     "Hubspot",
+    "Canva",
+    "Shutterstock",
+    "Google Ads",
+    "Facebook Ads",
 ]
 
 
+# =========================
+# Password protection
+# =========================
+def require_password():
+    if "APP_PASSWORD" not in st.secrets:
+        st.error("APP_PASSWORD no está configurado en secrets.")
+        st.stop()
+
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒 Acceso protegido")
+
+        password = st.text_input(
+            "Ingrese la contraseña",
+            type="password",
+        )
+
+        if password and password == st.secrets["APP_PASSWORD"]:
+            st.session_state.authenticated = True
+            st.rerun()
+        elif password:
+            st.error("Contraseña incorrecta")
+
+        st.stop()
+
+
+# =========================
+# Utilities
+# =========================
 def _get_base_path() -> str:
-    """
-    Choose a writable base path. Works locally and on some hosted environments.
-    """
     candidates = ["/mount/src/vs_bci_internacional", "/mount", "."]
     for c in candidates:
         try:
@@ -55,27 +82,14 @@ def _get_base_path() -> str:
     return "."
 
 
-def _require_password():
-    """
-    Optional password gate: only activates if you set st.secrets["app_password"].
-    """
-    try:
-        expected = st.secrets.get("app_password", None)
-    except Exception:
-        expected = None
-
-    if not expected:
-        return
-
-    pw = st.text_input("Password", type="password")
-    if pw != expected:
-        st.warning("Password required.")
-        st.stop()
-
-
+# =========================
+# Main app
+# =========================
 def main():
     st.set_page_config(page_title="BCI Internacional", layout="wide")
-    _require_password()
+
+    # 🔐 Password gate
+    require_password()
 
     st.title("BCI – Estado de Cuenta Internacional (USD)")
 
@@ -117,22 +131,17 @@ def main():
                 st.error(f"Error leyendo {filename}: {e}")
                 continue
 
-            # Optional exclude filters
             if exclude_terms:
-                filtered = []
-                for r in rows:
-                    desc = (r.get("DESCRIPCION") or "").lower()
-                    if any(term in desc for term in exclude_terms):
-                        continue
-                    filtered.append(r)
-                rows = filtered
+                rows = [
+                    r for r in rows
+                    if not any(term in (r.get("DESCRIPCION", "").lower()) for term in exclude_terms)
+                ]
 
             if rows:
                 insertar_en_db(conn, rows)
                 registrar_archivo_procesado(conn, filename)
                 ingested += 1
             else:
-                # Don't mark as processed if we extracted nothing
                 st.warning(
                     f"No se extrajeron filas desde {filename}. No se marca como procesado.")
                 skipped += 1
@@ -147,7 +156,7 @@ def main():
     df_db = pd.DataFrame(rows, columns=cols)
 
     # -------------------------
-    # Dashboard (no graphs)
+    # Dashboard
     # -------------------------
     st.divider()
     show_dashboard(df_db)
@@ -173,11 +182,11 @@ def main():
         pending = pending.sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[
                                       True, False]).reset_index(drop=True)
         pending["_FACT_KAME_DB"] = pending["FACT_KAME"]
-        pending["FACT_KAME"] = False  # UI selection only
+        pending["FACT_KAME"] = False
 
         editable_cols = [
             "_RID_",
-            "TITULAR_NOMBRE",  # ✅ NEW
+            "TITULAR_NOMBRE",
             "FECHA_OPERACION",
             "DESCRIPCION",
             "CIUDAD",
@@ -190,9 +199,7 @@ def main():
 
         show_all = st.checkbox(
             "Mostrar todas las filas pendientes", value=False)
-        view_df = pending[editable_cols].copy()
-        if not show_all:
-            view_df = view_df.head(20).copy()
+        view_df = pending[editable_cols].head(20 if not show_all else None)
 
         edited = st.data_editor(
             view_df,
@@ -200,7 +207,6 @@ def main():
             hide_index=True,
             column_config={
                 "_RID_": st.column_config.NumberColumn("ID", disabled=True),
-                # ✅ NEW
                 "TITULAR_NOMBRE": st.column_config.TextColumn("Titular", disabled=True),
                 "FECHA_OPERACION": st.column_config.TextColumn("Fecha (MM/DD/YY)", disabled=True),
                 "DESCRIPCION": st.column_config.TextColumn("Descripción", disabled=True),
@@ -210,93 +216,48 @@ def main():
                 "TIPO_GASTO": st.column_config.SelectboxColumn(
                     "Tipo gasto",
                     options=TIPO_GASTO_OPTIONS,
-                    required=False,
                 ),
                 "CONCILIADO": st.column_config.CheckboxColumn("Conciliado"),
                 "FACT_KAME": st.column_config.CheckboxColumn("Mover a Kame"),
             },
         )
 
-        left, right = st.columns([1, 1])
+        col1, col2 = st.columns(2)
 
-        with left:
-            if st.button("Guardar cambios (Tipo gasto / Conciliado)"):
-                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(
-                    orient="records")
-                update_rows(conn, updates)
-                st.success("Guardado.")
+        with col1:
+            if st.button("Guardar cambios"):
+                update_rows(
+                    conn, edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict("records"))
+                st.success("Cambios guardados")
                 st.rerun()
 
-        with right:
-            selected = edited[edited["FACT_KAME"] == True].copy()
+        with col2:
+            selected = edited[edited["FACT_KAME"] == True]
+            valid = (
+                not selected.empty
+                and selected["CONCILIADO"].all()
+                and not selected["TIPO_GASTO"].fillna("").str.strip().eq("").any()
+            )
 
-            can_move = True
-            if selected.empty:
-                can_move = False
-            else:
-                if not selected["CONCILIADO"].all():
-                    can_move = False
-                if selected["TIPO_GASTO"].fillna("").str.strip().eq("").any():
-                    can_move = False
-
-            if st.button("Mover seleccionadas a 'Ingresado en Kame'", disabled=not can_move):
-                rowids = selected["_RID_"].astype(int).tolist()
-
-                # Save edits before moving
-                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(
-                    orient="records")
-                update_rows(conn, updates)
-
-                mark_rows_as_kame(conn, rowids)
-                st.success(f"Movidas: {len(rowids)}")
+            if st.button("Mover a Kame", disabled=not valid):
+                update_rows(
+                    conn, edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict("records"))
+                mark_rows_as_kame(conn, selected["_RID_"].tolist())
+                st.success(f"{len(selected)} movidas a Kame")
                 st.rerun()
-
-            if (not selected.empty) and (not can_move):
-                st.info(
-                    "Para mover: todas deben estar CONCILIADAS y con TIPO_GASTO definido.")
-
-    st.markdown("### Ingresado en Kame")
-    if done.empty:
-        st.info("Aún no hay transacciones ingresadas.")
-    else:
-        st.dataframe(
-            done[
-                [
-                    "TITULAR_NOMBRE",  # ✅ NEW
-                    "FECHA_OPERACION",
-                    "DESCRIPCION",
-                    "CIUDAD",
-                    "PAIS",
-                    "MONTO_TOTAL",
-                    "TIPO_GASTO",
-                    "CONCILIADO",
-                    "ARCHIVO_ORIGEN",
-                ]
-            ].sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[True, False]),
-            use_container_width=True,
-            hide_index=True,
-        )
 
     # -------------------------
-    # 3) Export / Admin
+    # Export
     # -------------------------
     st.divider()
-    st.subheader("3) Exportar / Admin")
+    st.subheader("3) Exportar")
 
-    csv = df_db.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Descargar CSV (todas las transacciones)",
-        data=csv,
+        "Descargar CSV",
+        df_db.to_csv(index=False).encode("utf-8"),
         file_name="transacciones_internacional.csv",
     )
-
-    with st.expander("Reset database (borra todo)"):
-        if st.button("RESET DB"):
-            reset_db(conn)
-            st.warning("DB reseteada.")
-            st.rerun()
 
 
 if __name__ == "__main__":
     main()
-# ---end---
