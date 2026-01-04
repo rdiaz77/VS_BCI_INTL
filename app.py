@@ -26,14 +26,13 @@ TIPO_GASTO_OPTIONS = [
     "electronic",
     "libro",
     "otro",
-    "Airbnb",
-    "Uber",
     "Google Suite",
-    "Hubspot",
-    "Canva",
+    "software",
+    "Hardware",
     "Shutterstock",
-    "Google Ads",
-    "Facebook Ads",
+    "Airbnb",
+    "Canva",
+    "Hubspot",
 ]
 
 
@@ -51,10 +50,7 @@ def require_password():
     if not st.session_state.authenticated:
         st.title("🔒 Acceso protegido")
 
-        password = st.text_input(
-            "Ingrese la contraseña",
-            type="password",
-        )
+        password = st.text_input("Ingrese la contraseña", type="password")
 
         if password and password == st.secrets["APP_PASSWORD"]:
             st.session_state.authenticated = True
@@ -65,9 +61,6 @@ def require_password():
         st.stop()
 
 
-# =========================
-# Utilities
-# =========================
 def _get_base_path() -> str:
     candidates = ["/mount/src/vs_bci_internacional", "/mount", "."]
     for c in candidates:
@@ -82,9 +75,6 @@ def _get_base_path() -> str:
     return "."
 
 
-# =========================
-# Main app
-# =========================
 def main():
     st.set_page_config(page_title="BCI Internacional", layout="wide")
 
@@ -131,6 +121,7 @@ def main():
                 st.error(f"Error leyendo {filename}: {e}")
                 continue
 
+            # Optional exclude filters
             if exclude_terms:
                 rows = [
                     r for r in rows
@@ -156,7 +147,7 @@ def main():
     df_db = pd.DataFrame(rows, columns=cols)
 
     # -------------------------
-    # Dashboard
+    # Dashboard (no graphs)
     # -------------------------
     st.divider()
     show_dashboard(df_db)
@@ -174,6 +165,7 @@ def main():
     pending = df_db[df_db["FACT_KAME"] == 0].copy()
     done = df_db[df_db["FACT_KAME"] == 1].copy()
 
+    # -------- Pendientes --------
     st.markdown("### Pendientes (no ingresadas en Kame)")
 
     if pending.empty:
@@ -181,8 +173,7 @@ def main():
     else:
         pending = pending.sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[
                                       True, False]).reset_index(drop=True)
-        pending["_FACT_KAME_DB"] = pending["FACT_KAME"]
-        pending["FACT_KAME"] = False
+        pending["FACT_KAME"] = False  # UI selection only
 
         editable_cols = [
             "_RID_",
@@ -199,7 +190,9 @@ def main():
 
         show_all = st.checkbox(
             "Mostrar todas las filas pendientes", value=False)
-        view_df = pending[editable_cols].head(20 if not show_all else None)
+        view_df = pending[editable_cols].copy()
+        if not show_all:
+            view_df = view_df.head(20).copy()
 
         edited = st.data_editor(
             view_df,
@@ -232,7 +225,7 @@ def main():
                 st.rerun()
 
         with col2:
-            selected = edited[edited["FACT_KAME"] == True]
+            selected = edited[edited["FACT_KAME"] == True].copy()
             valid = (
                 not selected.empty
                 and selected["CONCILIADO"].all()
@@ -240,23 +233,58 @@ def main():
             )
 
             if st.button("Mover a Kame", disabled=not valid):
+                # Save edits first
                 update_rows(
                     conn, edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict("records"))
-                mark_rows_as_kame(conn, selected["_RID_"].tolist())
+                mark_rows_as_kame(conn, selected["_RID_"].astype(int).tolist())
                 st.success(f"{len(selected)} movidas a Kame")
                 st.rerun()
 
+            if (not selected.empty) and (not valid):
+                st.info(
+                    "Para mover: todas deben estar CONCILIADAS y con TIPO_GASTO definido.")
+
+    # -------- Ingresado en Kame --------
+    st.markdown("### Ingresado en Kame")
+
+    if done.empty:
+        st.info("Aún no hay transacciones ingresadas.")
+    else:
+        st.dataframe(
+            done[
+                [
+                    "TITULAR_NOMBRE",
+                    "FECHA_OPERACION",
+                    "DESCRIPCION",
+                    "CIUDAD",
+                    "PAIS",
+                    "MONTO_TOTAL",
+                    "TIPO_GASTO",
+                    "CONCILIADO",
+                    "ARCHIVO_ORIGEN",
+                ]
+            ].sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[True, False]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
     # -------------------------
-    # Export
+    # 3) Export / Admin
     # -------------------------
     st.divider()
-    st.subheader("3) Exportar")
+    st.subheader("3) Exportar / Admin")
 
     st.download_button(
         "Descargar CSV",
         df_db.to_csv(index=False).encode("utf-8"),
         file_name="transacciones_internacional.csv",
     )
+
+    with st.expander("Reset database (borra todo)"):
+        if st.button("RESET DB"):
+            reset_db(conn)
+            st.warning("DB reseteada.")
+            st.rerun()
 
 
 if __name__ == "__main__":
