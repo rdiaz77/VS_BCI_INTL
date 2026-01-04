@@ -3,6 +3,24 @@ from pathlib import Path
 from typing import Iterable, Dict, Any, List, Tuple
 
 
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table});")
+    cols = [row[1] for row in cur.fetchall()]  # row[1] = column name
+    return column in cols
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """
+    Lightweight migrations for existing DBs.
+    Adds TITULAR_NOMBRE if it doesn't exist.
+    """
+    if _column_exists(conn, "transacciones", "TITULAR_NOMBRE"):
+        return
+
+    conn.execute("ALTER TABLE transacciones ADD COLUMN TITULAR_NOMBRE TEXT;")
+    conn.commit()
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Create/connect SQLite DB and ensure tables exist."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -37,6 +55,10 @@ def init_db(db_path: str) -> sqlite3.Connection:
     )
 
     conn.commit()
+
+    # ✅ auto-migration
+    _ensure_schema(conn)
+
     return conn
 
 
@@ -55,33 +77,72 @@ def insertar_en_db(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]]) -> 
     if not rows:
         return 0
 
-    conn.executemany(
-        """
-        INSERT INTO transacciones(
-            FECHA_OPERACION, DESCRIPCION, CIUDAD, PAIS, REF_INTERNACIONAL,
-            MONTO_ORIGEN, MONTO_OPERACION, MONTO_TOTAL,
-            TIPO_GASTO, FACT_KAME, ARCHIVO_ORIGEN, CONCILIADO
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """,
-        [
-            (
-                r.get("FECHA_OPERACION", ""),
-                r.get("DESCRIPCION", ""),
-                r.get("CIUDAD", ""),
-                r.get("PAIS", ""),
-                r.get("REF_INTERNACIONAL", ""),
-                r.get("MONTO_ORIGEN", None),
-                r.get("MONTO_OPERACION", None),
-                r.get("MONTO_TOTAL", None),
-                r.get("TIPO_GASTO", ""),
-                int(r.get("FACT_KAME", 0)),
-                r.get("ARCHIVO_ORIGEN", ""),
-                int(r.get("CONCILIADO", 0)),
+    # Ensure schema before inserting (safe even if called repeatedly)
+    _ensure_schema(conn)
+
+    # Insert depending on whether TITULAR_NOMBRE exists in schema
+    has_titular = _column_exists(conn, "transacciones", "TITULAR_NOMBRE")
+
+    if has_titular:
+        conn.executemany(
+            """
+            INSERT INTO transacciones(
+                TITULAR_NOMBRE,
+                FECHA_OPERACION, DESCRIPCION, CIUDAD, PAIS, REF_INTERNACIONAL,
+                MONTO_ORIGEN, MONTO_OPERACION, MONTO_TOTAL,
+                TIPO_GASTO, FACT_KAME, ARCHIVO_ORIGEN, CONCILIADO
             )
-            for r in rows
-        ],
-    )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            [
+                (
+                    r.get("TITULAR_NOMBRE", None),
+                    r.get("FECHA_OPERACION", ""),
+                    r.get("DESCRIPCION", ""),
+                    r.get("CIUDAD", ""),
+                    r.get("PAIS", ""),
+                    r.get("REF_INTERNACIONAL", ""),
+                    r.get("MONTO_ORIGEN", None),
+                    r.get("MONTO_OPERACION", None),
+                    r.get("MONTO_TOTAL", None),
+                    r.get("TIPO_GASTO", ""),
+                    int(r.get("FACT_KAME", 0)),
+                    r.get("ARCHIVO_ORIGEN", ""),
+                    int(r.get("CONCILIADO", 0)),
+                )
+                for r in rows
+            ],
+        )
+    else:
+        # fallback (shouldn't happen because _ensure_schema adds it)
+        conn.executemany(
+            """
+            INSERT INTO transacciones(
+                FECHA_OPERACION, DESCRIPCION, CIUDAD, PAIS, REF_INTERNACIONAL,
+                MONTO_ORIGEN, MONTO_OPERACION, MONTO_TOTAL,
+                TIPO_GASTO, FACT_KAME, ARCHIVO_ORIGEN, CONCILIADO
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            [
+                (
+                    r.get("FECHA_OPERACION", ""),
+                    r.get("DESCRIPCION", ""),
+                    r.get("CIUDAD", ""),
+                    r.get("PAIS", ""),
+                    r.get("REF_INTERNACIONAL", ""),
+                    r.get("MONTO_ORIGEN", None),
+                    r.get("MONTO_OPERACION", None),
+                    r.get("MONTO_TOTAL", None),
+                    r.get("TIPO_GASTO", ""),
+                    int(r.get("FACT_KAME", 0)),
+                    r.get("ARCHIVO_ORIGEN", ""),
+                    int(r.get("CONCILIADO", 0)),
+                )
+                for r in rows
+            ],
+        )
+
     conn.commit()
     return len(rows)
 
@@ -94,10 +155,6 @@ def fetch_all(conn: sqlite3.Connection) -> Tuple[List[str], List[tuple]]:
 
 
 def update_rows(conn: sqlite3.Connection, updates: List[Dict[str, Any]]) -> None:
-    """
-    Update rows by rowid (_RID_). Expected keys:
-      _RID_, TIPO_GASTO, CONCILIADO
-    """
     conn.executemany(
         """
         UPDATE transacciones

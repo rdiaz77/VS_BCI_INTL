@@ -1,49 +1,76 @@
 from __future__ import annotations
 
+import io
 import re
-from typing import BinaryIO, Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import pdfplumber
+from unidecode import unidecode
 
 
 DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{2}\b")
 PAIS_RE = re.compile(r"^[A-Z]{2}$")
 REF_RE = re.compile(r"^\d{10,}$")
-PREFIX_RE = re.compile(r"^\d{4}$")
-# Amount formats: 49,44 ; -17,35 ; 49.640,00
+
+# Examples: 49,44 ; -17,35 ; 49.640,00
 AMOUNT_RE = re.compile(r"^-?\d{1,3}(?:\.\d{3})*(?:,\d{2})$|^-?\d+(?:,\d{2})$")
 
 
+def _norm(s: str) -> str:
+    """Uppercase + remove accents (robust PDF matching)."""
+    return unidecode(s).upper()
+
+
 def _to_float(amount_str: str) -> float:
-    """
-    Convert international statement amount to float.
-    Examples: "49,44" -> 49.44 ; "49.640,00" -> 49640.00 ; "-17,35" -> -17.35
-    """
     s = amount_str.strip().replace("US$", "").replace("$", "")
     s = s.replace(".", "").replace(",", ".")
     return float(s)
 
 
-def _extract_header_fields(full_text: str) -> Tuple[Optional[str], Optional[str]]:
-    # TITULAR
-    titular = None
-    m = re.search(r"NOMBRE DEL TITULAR\s+([A-ZÁÉÍÓÚÑ ]+)\s+N° DE TARJETA", full_text, re.DOTALL)
-    if m:
-        titular = " ".join(m.group(1).split()).strip()
+def _ddmmyy_to_mmddyy(ddmmyy: str) -> str:
+    dd, mm, yy = ddmmyy.split("/")
+    return f"{mm}/{dd}/{yy}"
 
-    # FECHA ESTADO DE CUENTA
+
+# =========================
+# Header extraction
+# =========================
+def _extract_header_fields(full_text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns:
+      titular_full_name, titular_first_name, fecha_estado
+    """
+    titular_full = None
+    titular_first = None
     fecha_estado = None
+
+    # Full name
+    m = re.search(
+        r"NOMBRE DEL TITULAR\s+([A-ZÁÉÍÓÚÑ ]+)\s+N° DE TARJETA",
+        full_text,
+        re.DOTALL,
+    )
+    if m:
+        titular_full = " ".join(m.group(1).split()).strip()
+        titular_first = titular_full.split()[0]
+
+    # Statement date (not critical, but used for archivo_origen)
     m2 = re.search(r"FECHA ESTADO DE CUENTA\s+(\d{2}/\d{2}/\d{4})", full_text)
     if m2:
         fecha_estado = m2.group(1)
 
-    return titular, fecha_estado
+    return titular_full, titular_first, fecha_estado
 
 
-def _build_archivo_origen(filename: str, titular: Optional[str], fecha_estado: Optional[str]) -> str:
-    if titular and fecha_estado:
-        safe_tit = "_".join(titular.split())
-        safe_fecha = fecha_estado.replace("/", "-")
-        return f"BCI_INT_{safe_tit}_{safe_fecha}"
+def _build_archivo_origen(
+    filename: str,
+    titular_full: Optional[str],
+    fecha_estado: Optional[str],
+) -> str:
+    if titular_full and fecha_estado:
+        safe_name = "_".join(titular_full.split())
+        safe_date = fecha_estado.replace("/", "-")
+        return f"BCI_INT_{safe_name}_{safe_date}"
     return filename
 
 
@@ -59,53 +86,41 @@ def _find_trailing_amounts(tokens: List[str]) -> List[str]:
 
 
 def _split_desc_city_pais(tokens_after_date: List[str], pais: str) -> Tuple[str, str]:
-    """
-    Heuristic:
-    - City is the last 1-3 tokens immediately before PAIS (if PAIS is present) and not empty.
-    - Description is whatever comes before city.
-    """
     if not pais:
         return (" ".join(tokens_after_date).strip(), "")
 
-    # tokens_after_date includes city + pais + maybe other text? We will split using last occurrence of pais.
-    # Find last index of pais
     try:
         idx = len(tokens_after_date) - 1 - list(reversed(tokens_after_date)).index(pais)
     except ValueError:
         return (" ".join(tokens_after_date).strip(), "")
 
     before_pais = tokens_after_date[:idx]
-    # pick up to last 3 tokens as city
-    city_tokens = before_pais[-3:] if before_pais else []
-    # but avoid swallowing description if it's short: keep at least 1 token in description when possible
+    if not before_pais:
+        return ("", "")
+
     if len(before_pais) <= 1:
-        city_tokens = before_pais
-        desc_tokens = []
-    else:
-        # if before_pais length > 3, treat last 1-3 as city and remaining as description
-        desc_tokens = before_pais[:-len(city_tokens)] if city_tokens else before_pais
+        return (" ".join(before_pais).strip(), "")
 
-    city = " ".join(city_tokens).strip()
+    city_tokens = before_pais[-3:] if len(before_pais) > 3 else before_pais[-1:]
+    desc_tokens = before_pais[:-len(city_tokens)] if len(before_pais) > len(city_tokens) else []
+
     desc = " ".join(desc_tokens).strip()
+    city = " ".join(city_tokens).strip()
 
-    # if desc ended empty, fallback to all before pais as desc
     if not desc:
         desc = " ".join(before_pais).strip()
         city = ""
+
     return desc, city
 
 
-def _parse_transaction_line(line: str, archivo_origen: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse a single line that includes a date. Returns a normalized row or None.
-    Expected formats found in international statements:
-      <prefix4> <ref_long> <dd/mm/yy> <desc...> <city...> <PAIS> <monto_origen> <monto_usd>
-    Or in commissions block sometimes:
-      <prefix4> <ref_long> <dd/mm/yy> <desc...> <city...> <monto_origen> <monto_usd_negative>
-      (PAIS may be absent)
-    """
+def _parse_transaction_line(
+    line: str,
+    archivo_origen: str,
+    titular_first_name: Optional[str],
+) -> Optional[Dict[str, Any]]:
     tokens = line.split()
-    # Must contain date token
+
     try:
         date_idx = next(i for i, t in enumerate(tokens) if DATE_RE.fullmatch(t))
     except StopIteration:
@@ -115,53 +130,39 @@ def _parse_transaction_line(line: str, archivo_origen: str) -> Optional[Dict[str
     if not trailing:
         return None
 
-    # Determine monto_origen and monto_usd
-    monto_origen = None
-    monto_usd = None
-    if len(trailing) >= 2:
-        monto_origen = trailing[-2]
-        monto_usd = trailing[-1]
-    else:
-        monto_usd = trailing[-1]
+    monto_origen = trailing[-2] if len(trailing) >= 2 else None
+    monto_usd = trailing[-1]
 
-    # core tokens before trailing amounts
-    core = tokens[: len(tokens) - len(trailing)]
+    desc_tokens = tokens[date_idx + 1 : len(tokens) - len(trailing)]
 
-    # detect pais (token right before amounts, in core)
     pais = ""
-    if core and PAIS_RE.match(core[-1]):
-        pais = core[-1]
-        core = core[:-1]
-
-    # detect prefix and ref if present (best-effort)
-    prefix = core[0] if len(core) >= 1 and PREFIX_RE.match(core[0]) else ""
-    ref = core[1] if len(core) >= 2 and REF_RE.match(core[1]) else ""
-
-    # tokens after date (excluding trailing amounts)
-    tokens_after_date = tokens[date_idx + 1 : len(tokens) - len(trailing)]
-    # if pais exists and appears inside tokens_after_date at end, keep it there for desc/city split
-    desc = ""
-    city = ""
-    if pais:
-        desc, city = _split_desc_city_pais(tokens_after_date, pais)
+    ciudad = ""
+    if desc_tokens and PAIS_RE.match(desc_tokens[-1]):
+        pais = desc_tokens[-1]
+        desc, ciudad = _split_desc_city_pais(desc_tokens, pais)
     else:
-        desc = " ".join(tokens_after_date).strip()
+        desc = " ".join(desc_tokens).strip()
 
-    # basic sanity: skip totals
     if not desc or desc.upper().startswith("TOTAL"):
         return None
 
-    # Convert amounts to float
+    ref = ""
+    if date_idx >= 2 and REF_RE.match(tokens[date_idx - 1]):
+        ref = tokens[date_idx - 1]
+
     try:
         monto_usd_f = _to_float(monto_usd)
-        monto_origen_f = _to_float(monto_origen) if monto_origen is not None else None
+        monto_origen_f = _to_float(monto_origen) if monto_origen else None
     except Exception:
         return None
 
+    fecha_mmddyy = _ddmmyy_to_mmddyy(tokens[date_idx])
+
     return {
-        "FECHA_OPERACION": tokens[date_idx],
+        "TITULAR_NOMBRE": titular_first_name,  # ✅ NEW COLUMN
+        "FECHA_OPERACION": fecha_mmddyy,
         "DESCRIPCION": desc,
-        "CIUDAD": city,
+        "CIUDAD": ciudad,
         "PAIS": pais,
         "REF_INTERNACIONAL": ref,
         "MONTO_ORIGEN": monto_origen_f,
@@ -175,23 +176,14 @@ def _parse_transaction_line(line: str, archivo_origen: str) -> Optional[Dict[str
 
 
 def leer_cartola_internacional(pdf_bytes: bytes, filename: str = "archivo.pdf") -> List[Dict[str, Any]]:
-    """
-    Read BCI International statement PDF and return normalized rows for DB insertion.
-    """
     rows: List[Dict[str, Any]] = []
 
-    with pdfplumber.open(io=pdf_bytes) as pdf:
-        # Collect all text for header parsing
-        all_text_parts = []
-        page_texts = []
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            page_texts.append(t)
-            all_text_parts.append(t)
-        full_text = "\n".join(all_text_parts)
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        page_texts = [(p.extract_text() or "") for p in pdf.pages]
+        full_text = "\n".join(page_texts)
 
-        titular, fecha_estado = _extract_header_fields(full_text)
-        archivo_origen = _build_archivo_origen(filename, titular, fecha_estado)
+        titular_full, titular_first, fecha_estado = _extract_header_fields(full_text)
+        archivo_origen = _build_archivo_origen(filename, titular_full, fecha_estado)
 
         in_transacciones = False
         in_comisiones = False
@@ -202,10 +194,9 @@ def leer_cartola_internacional(pdf_bytes: bytes, filename: str = "archivo.pdf") 
                 if not line:
                     continue
 
-                u = line.upper()
+                u = _norm(line)
 
-                # Section toggles
-                if "2. INFORMACIÓN DE TRANSACCIONES" in u:
+                if "2. INFORMACION DE TRANSACCIONES" in u:
                     in_transacciones = True
                     in_comisiones = False
                     continue
@@ -215,30 +206,50 @@ def leer_cartola_internacional(pdf_bytes: bytes, filename: str = "archivo.pdf") 
                     in_transacciones = False
                     continue
 
-                # Stop blocks at totals
                 if u.startswith("TOTAL TARJETA"):
                     in_transacciones = False
-                    # commissions may continue after, so do not change in_comisiones here
                     continue
 
-                # Ignore header lines inside the table
-                if u.startswith(("NUMERO", "FECHA", "DESCRIPCION", "CIUDAD", "PAIS", "MONTO", "TOTAL DE PAGOS", "TOTAL DE COMPRAS")):
+                if u.startswith(
+                    (
+                        "NUMERO",
+                        "FECHA",
+                        "DESCRIPCION",
+                        "CIUDAD",
+                        "PAIS",
+                        "MONTO",
+                        "TOTAL DE PAGOS",
+                        "TOTAL DE COMPRAS",
+                    )
+                ):
                     continue
 
-                # Only parse lines inside relevant sections
                 if not (in_transacciones or in_comisiones):
                     continue
 
                 if not DATE_RE.search(line):
                     continue
 
-                row = _parse_transaction_line(line, archivo_origen)
+                row = _parse_transaction_line(
+                    line,
+                    archivo_origen,
+                    titular_first_name=titular_first,
+                )
                 if row:
                     rows.append(row)
 
-    # Deduplicate (same line might appear across page breaks / extraction artifacts)
+    # Deduplicate
     uniq = {}
     for r in rows:
-        key = (r["FECHA_OPERACION"], r["DESCRIPCION"], r.get("PAIS",""), r["MONTO_OPERACION"], r["ARCHIVO_ORIGEN"])
+        key = (
+            r["TITULAR_NOMBRE"],
+            r["FECHA_OPERACION"],
+            r["DESCRIPCION"],
+            r.get("PAIS", ""),
+            r["MONTO_OPERACION"],
+            r["ARCHIVO_ORIGEN"],
+        )
         uniq[key] = r
+
     return list(uniq.values())
+# ---end--- 

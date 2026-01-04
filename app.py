@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
-import streamlit as st
+
 import pandas as pd
+import streamlit as st
 
 from data.database import (
     init_db,
@@ -17,8 +18,30 @@ from data.extractor_internacional import leer_cartola_internacional
 from dashboard import show_dashboard
 
 
+TIPO_GASTO_OPTIONS = [
+    "movilizacion",
+    "comida",
+    "alojamiento",
+    "combustible",
+    "electronic",
+    "libro",
+    "otro",
+    "Google Suite",
+    "software",
+    "Google Ads",
+    "Facebook Ads",
+    "Shuttherstock",
+    "Canva",
+    "Airbnb",
+    "Uber",
+    "Hubspot",
+]
+
+
 def _get_base_path() -> str:
-    # Try common persistent locations (Streamlit Cloud / containers)
+    """
+    Choose a writable base path. Works locally and on some hosted environments.
+    """
     candidates = ["/mount/src/vs_bci_internacional", "/mount", "."]
     for c in candidates:
         try:
@@ -33,7 +56,9 @@ def _get_base_path() -> str:
 
 
 def _require_password():
-    # Optional password gate: only activates if you set st.secrets["app_password"]
+    """
+    Optional password gate: only activates if you set st.secrets["app_password"].
+    """
     try:
         expected = st.secrets.get("app_password", None)
     except Exception:
@@ -58,35 +83,41 @@ def main():
     db_path = str(Path(base_path) / "cartolas_bci_internacional.db")
     conn = init_db(db_path)
 
-    # Upload
+    # -------------------------
+    # 1) Upload PDFs
+    # -------------------------
     st.subheader("1) Cargar PDFs (Internacional)")
-    uploaded = st.file_uploader("Sube uno o más PDF", type=["pdf"], accept_multiple_files=True)
+    uploaded = st.file_uploader("Sube uno o más PDF", type=[
+                                "pdf"], accept_multiple_files=True)
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        exclude_terms_raw = st.text_input(
-            "Excluir términos en DESCRIPCION (separados por coma)",
-            value="",
-            help="Ej: PAGO, TOTAL, ABONO",
-        )
-    exclude_terms = [t.strip().lower() for t in exclude_terms_raw.split(",") if t.strip()]
+    exclude_terms_raw = st.text_input(
+        "Excluir términos en DESCRIPCION (separados por coma)",
+        value="",
+        help="Ej: PAGO, TOTAL, ABONO",
+    )
+    exclude_terms = [t.strip().lower()
+                     for t in exclude_terms_raw.split(",") if t.strip()]
 
     if uploaded:
         ingested = 0
         skipped = 0
+
         for f in uploaded:
             filename = f.name
+
             if archivo_ya_procesado(conn, filename):
                 skipped += 1
                 continue
 
             pdf_bytes = f.read()
+
             try:
                 rows = leer_cartola_internacional(pdf_bytes, filename=filename)
             except Exception as e:
                 st.error(f"Error leyendo {filename}: {e}")
                 continue
 
+            # Optional exclude filters
             if exclude_terms:
                 filtered = []
                 for r in rows:
@@ -101,21 +132,29 @@ def main():
                 registrar_archivo_procesado(conn, filename)
                 ingested += 1
             else:
-                registrar_archivo_procesado(conn, filename)  # avoid reprocessing empty files
+                # Don't mark as processed if we extracted nothing
+                st.warning(
+                    f"No se extrajeron filas desde {filename}. No se marca como procesado.")
                 skipped += 1
 
         st.success(f"Listo. Ingestados: {ingested} | Omitidos: {skipped}")
         st.rerun()
 
+    # -------------------------
     # Load DB
+    # -------------------------
     cols, rows = fetch_all(conn)
     df_db = pd.DataFrame(rows, columns=cols)
 
-    # Dashboard
+    # -------------------------
+    # Dashboard (no graphs)
+    # -------------------------
     st.divider()
     show_dashboard(df_db)
 
-    # Workflow tables
+    # -------------------------
+    # 2) Conciliación / Kame
+    # -------------------------
     st.divider()
     st.subheader("2) Conciliación / Kame")
 
@@ -131,13 +170,14 @@ def main():
     if pending.empty:
         st.success("No hay pendientes 🎉")
     else:
-        # UI checkbox column for selecting rows to move
-        pending = pending.sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[True, False]).reset_index(drop=True)
+        pending = pending.sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[
+                                      True, False]).reset_index(drop=True)
         pending["_FACT_KAME_DB"] = pending["FACT_KAME"]
         pending["FACT_KAME"] = False  # UI selection only
 
         editable_cols = [
             "_RID_",
+            "TITULAR_NOMBRE",  # ✅ NEW
             "FECHA_OPERACION",
             "DESCRIPCION",
             "CIUDAD",
@@ -148,18 +188,30 @@ def main():
             "FACT_KAME",
         ]
 
+        show_all = st.checkbox(
+            "Mostrar todas las filas pendientes", value=False)
+        view_df = pending[editable_cols].copy()
+        if not show_all:
+            view_df = view_df.head(20).copy()
+
         edited = st.data_editor(
-            pending[editable_cols],
+            view_df,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "_RID_": st.column_config.NumberColumn("ID", disabled=True),
-                "FECHA_OPERACION": st.column_config.TextColumn("Fecha", disabled=True),
+                # ✅ NEW
+                "TITULAR_NOMBRE": st.column_config.TextColumn("Titular", disabled=True),
+                "FECHA_OPERACION": st.column_config.TextColumn("Fecha (MM/DD/YY)", disabled=True),
                 "DESCRIPCION": st.column_config.TextColumn("Descripción", disabled=True),
                 "CIUDAD": st.column_config.TextColumn("Ciudad", disabled=True),
                 "PAIS": st.column_config.TextColumn("País", disabled=True),
                 "MONTO_TOTAL": st.column_config.NumberColumn("Monto (US$)", format="%.2f", disabled=True),
-                "TIPO_GASTO": st.column_config.TextColumn("Tipo gasto"),
+                "TIPO_GASTO": st.column_config.SelectboxColumn(
+                    "Tipo gasto",
+                    options=TIPO_GASTO_OPTIONS,
+                    required=False,
+                ),
                 "CONCILIADO": st.column_config.CheckboxColumn("Conciliado"),
                 "FACT_KAME": st.column_config.CheckboxColumn("Mover a Kame"),
             },
@@ -167,22 +219,21 @@ def main():
 
         left, right = st.columns([1, 1])
 
-        # Save edits
         with left:
             if st.button("Guardar cambios (Tipo gasto / Conciliado)"):
-                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(orient="records")
+                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(
+                    orient="records")
                 update_rows(conn, updates)
                 st.success("Guardado.")
                 st.rerun()
 
-        # Move selected
         with right:
             selected = edited[edited["FACT_KAME"] == True].copy()
+
             can_move = True
             if selected.empty:
                 can_move = False
             else:
-                # Validation: all selected must be conciliado and have tipo_gasto
                 if not selected["CONCILIADO"].all():
                     can_move = False
                 if selected["TIPO_GASTO"].fillna("").str.strip().eq("").any():
@@ -190,15 +241,19 @@ def main():
 
             if st.button("Mover seleccionadas a 'Ingresado en Kame'", disabled=not can_move):
                 rowids = selected["_RID_"].astype(int).tolist()
-                # Ensure edits are saved before moving
-                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(orient="records")
+
+                # Save edits before moving
+                updates = edited[["_RID_", "TIPO_GASTO", "CONCILIADO"]].to_dict(
+                    orient="records")
                 update_rows(conn, updates)
+
                 mark_rows_as_kame(conn, rowids)
                 st.success(f"Movidas: {len(rowids)}")
                 st.rerun()
 
             if (not selected.empty) and (not can_move):
-                st.info("Para mover: todas deben estar CONCILIADAS y con TIPO_GASTO definido.")
+                st.info(
+                    "Para mover: todas deben estar CONCILIADAS y con TIPO_GASTO definido.")
 
     st.markdown("### Ingresado en Kame")
     if done.empty:
@@ -207,6 +262,7 @@ def main():
         st.dataframe(
             done[
                 [
+                    "TITULAR_NOMBRE",  # ✅ NEW
                     "FECHA_OPERACION",
                     "DESCRIPCION",
                     "CIUDAD",
@@ -221,12 +277,18 @@ def main():
             hide_index=True,
         )
 
-    # Export / admin
+    # -------------------------
+    # 3) Export / Admin
+    # -------------------------
     st.divider()
     st.subheader("3) Exportar / Admin")
 
     csv = df_db.to_csv(index=False).encode("utf-8")
-    st.download_button("Descargar CSV (todas las transacciones)", data=csv, file_name="transacciones_internacional.csv")
+    st.download_button(
+        "Descargar CSV (todas las transacciones)",
+        data=csv,
+        file_name="transacciones_internacional.csv",
+    )
 
     with st.expander("Reset database (borra todo)"):
         if st.button("RESET DB"):
@@ -237,3 +299,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ---end---

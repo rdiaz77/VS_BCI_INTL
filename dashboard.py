@@ -1,18 +1,17 @@
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 
 def _parse_dates(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["FECHA_DT"] = pd.to_datetime(out["FECHA_OPERACION"], format="%d/%m/%y", errors="coerce")
+    out["FECHA_DT"] = pd.to_datetime(out["FECHA_OPERACION"], format="%m/%d/%y", errors="coerce")
     return out
 
 
 def show_dashboard(df_db: pd.DataFrame) -> None:
     st.subheader("Dashboard")
 
-    if df_db.empty:
+    if df_db is None or df_db.empty:
         st.info("No hay datos aún.")
         return
 
@@ -26,16 +25,21 @@ def show_dashboard(df_db: pd.DataFrame) -> None:
     if month_sel != "Todos":
         df = df[df["MES"] == month_sel].copy()
 
-    # Text search
+    # Search
     q = st.text_input("Buscar en descripción", value="")
     if q.strip():
-        df = df[df["DESCRIPCION"].str.contains(q.strip(), case=False, na=False)]
+        df = df[df["DESCRIPCION"].astype(str).str.contains(q.strip(), case=False, na=False)].copy()
+
+    # Numeric safety
+    df["MONTO_TOTAL"] = pd.to_numeric(df["MONTO_TOTAL"], errors="coerce").fillna(0.0)
+    if "MONTO_OPERACION" in df.columns:
+        df["MONTO_OPERACION"] = pd.to_numeric(df["MONTO_OPERACION"], errors="coerce").fillna(0.0)
 
     # KPIs
-    total = df["MONTO_TOTAL"].sum()
-    count = len(df)
-    avg = df["MONTO_TOTAL"].mean() if count else 0.0
-    conc = int((df["CONCILIADO"] == 1).sum())
+    total = float(df["MONTO_TOTAL"].sum())
+    count = int(len(df))
+    avg = float(df["MONTO_TOTAL"].mean()) if count else 0.0
+    conc = int((df.get("CONCILIADO", 0) == 1).sum()) if "CONCILIADO" in df.columns else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total (US$)", f"{total:,.2f}")
@@ -43,54 +47,34 @@ def show_dashboard(df_db: pd.DataFrame) -> None:
     c3.metric("Promedio (US$)", f"{avg:,.2f}")
     c4.metric("Conciliadas", f"{conc}")
 
-    # Top merchants/descriptions
-    top = (
-        df.groupby("DESCRIPCION", as_index=False)["MONTO_TOTAL"]
-        .sum()
-        .sort_values("MONTO_TOTAL", ascending=False)
-        .head(10)
-    )
-    if not top.empty:
-        fig = px.bar(top, x="MONTO_TOTAL", y="DESCRIPCION", orientation="h")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Monthly trend
-    trend = (
-        df.dropna(subset=["FECHA_DT"])
-        .groupby(df["FECHA_DT"].dt.to_period("M").astype(str), as_index=False)["MONTO_TOTAL"]
-        .sum()
-        .rename(columns={"FECHA_DT": "MES"})
-    )
-    trend.columns = ["MES", "MONTO_TOTAL"]
-    if len(trend) > 1:
-        fig2 = px.line(trend, x="MES", y="MONTO_TOTAL", markers=True)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # Reconciliation pie
-    pie = pd.DataFrame(
-        {
-            "Estado": ["Conciliadas", "Pendientes"],
-            "Cantidad": [int((df["CONCILIADO"] == 1).sum()), int((df["CONCILIADO"] == 0).sum())],
-        }
-    )
-    fig3 = px.pie(pie, names="Estado", values="Cantidad")
-    st.plotly_chart(fig3, use_container_width=True)
-
     with st.expander("Ver tabla filtrada"):
-        st.dataframe(
-            df[
-                [
-                    "FECHA_OPERACION",
-                    "DESCRIPCION",
-                    "CIUDAD",
-                    "PAIS",
-                    "MONTO_OPERACION",
-                    "MONTO_TOTAL",
-                    "TIPO_GASTO",
-                    "CONCILIADO",
-                    "FACT_KAME",
-                    "ARCHIVO_ORIGEN",
-                ]
-            ].sort_values(["FECHA_OPERACION", "MONTO_TOTAL"], ascending=[True, False]),
-            use_container_width=True,
-        )
+        preferred_cols = [
+            "TITULAR_NOMBRE",  # ✅ NEW
+            "FECHA_OPERACION",
+            "DESCRIPCION",
+            "CIUDAD",
+            "PAIS",
+            "MONTO_OPERACION",
+            "MONTO_TOTAL",
+            "TIPO_GASTO",
+            "CONCILIADO",
+            "FACT_KAME",
+            "ARCHIVO_ORIGEN",
+        ]
+        cols = [c for c in preferred_cols if c in df.columns]
+
+        df_sorted = df.copy()
+        if "FECHA_DT" in df_sorted.columns:
+            df_sorted = df_sorted.sort_values(
+                ["FECHA_DT", "MONTO_TOTAL"],
+                ascending=[True, False],
+                na_position="last",
+            )
+        else:
+            df_sorted = df_sorted.sort_values(
+                ["FECHA_OPERACION", "MONTO_TOTAL"],
+                ascending=[True, False],
+                na_position="last",
+            )
+
+        st.dataframe(df_sorted[cols], use_container_width=True)
